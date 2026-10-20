@@ -307,76 +307,151 @@ class ModelData:
 
         return out
 
+    def _get_busfreq_cached_matches(self, key, val):   # Extra function added by Nikhil
+        if not hasattr(self.system, "_find_idx_cache"):
+            self.system._find_idx_cache = {}
+
+        model_cache = self.system._find_idx_cache.setdefault(self.class_name, {})
+        key_cache = model_cache.setdefault(key, {"size": 0, "map": {}})
+
+        old_size = key_cache["size"]  # size of old cached dict
+        new_size = len(self.idx.v)   # current number of devices
+
+        arr = self.__dict__[key].v  # device values
+        idx_arr = self.idx.v   # device names
+
+        if new_size < old_size:  # rebuild the cache_map in case the size reduces
+            cache_map = {}
+            for pos, item in enumerate(arr):
+                cache_map.setdefault(item, []).append(idx_arr[pos])
+            key_cache["map"] = cache_map
+            key_cache["size"] = new_size
+
+        elif new_size > old_size:        # if size increases add the new entry into the dictionary
+            cache_map = key_cache["map"]
+            for pos in range(old_size, new_size):
+                item = arr[pos]
+                cache_map.setdefault(item, []).append(idx_arr[pos])
+            key_cache["size"] = new_size
+
+        return key_cache["map"].get(val, [])
+
     def find_idx(self, keys, values, allow_none=False, default=False, allow_all=False):
-        """
-        Find `idx` of devices whose values match the given pattern.
-
-        Parameters
-        ----------
-        keys : str, array-like, Sized
-            A string or an array-like of strings containing the names of parameters for the search criteria
-        values : array, array of arrays, Sized
-            Values for the corresponding key to search for. If keys is a str, values should be an array of
-            elements. If keys is a list, values should be an array of arrays, each corresponds to the key.
-        allow_none : bool, Sized, optional
-            Allow key, value to be not found. Used by groups.
-        default : bool, optional
-            Default idx to return if not found (missing)
-        allow_all : bool, optional
-            If True, returns a list of lists where each nested list contains all the matches for the
-            corresponding search criteria.
-
-        Returns
-        -------
-        list
-            indices of devices
-
-        Notes
-        -----
-        - Only the first match is returned by default.
-        - If all matches are needed, set `allow_all` to True.
-
-        Examples
-        --------
-        >>> # Use example case of IEEE 14-bus system with PVD1
-        >>> ss = andes.load(andes.get_case('ieee14/ieee14_pvd1.xlsx'))
-
-        >>> # To find the idx of `PVD1` with `name` of 'PVD1_1' and 'PVD1_2'
-        >>> ss.PVD1.find_idx(keys='name', values=['PVD1_1', 'PVD1_2'])
-        [1, 2]
-
-        >>> # To find the idx of `PVD1` connected to bus 4
-        >>> ss.PVD1.find_idx(keys='bus', values=[4])
-        [1]
-
-        >>> # To find ALL the idx of `PVD1` with `gammap` equals to 0.1
-        >>> ss.PVD1.find_idx(keys='gammap', values=[0.1], allow_all=True)
-        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
-
-        >>> # To find the idx of `PVD1` with `gammap` equals to 0.1 and `name` of 'PVD1_1'
-        >>> ss.PVD1.find_idx(keys=['gammap', 'name'], values=[[0.1], ['PVD1_1']])
-        [1]
-        """
-
         keys, values = validate_keys_values(keys, values)
+
+        # No devices in this model
+        if len(self.idx.v) == 0:
+            n_search = len(values[0])
+            if not allow_none:
+                raise IndexError(f'No {self.class_name} device found: model is empty')
+            return [[default] for _ in range(n_search)] if allow_all else [default] * n_search
+
+        # Special cached path for BusFreq: one key, one search value
+        if self.class_name == "BusFreq" and len(keys) == 1 and len(values[0]) == 1:
+            # breakpoint()
+            key = keys[0]
+            val = values[0][0]
+            matches = self._get_busfreq_cached_matches(key, val)
+
+            if not matches:
+                if not allow_none:
+                    raise IndexError(
+                        f'No {self.class_name} device found matching {list(keys)}={(val,)}'
+                    )
+                return [[default]] if allow_all else [default]
+
+            return [matches] if allow_all else [matches[0]]
 
         v_attrs = [self.__dict__[key].v for key in keys]
 
+        lookup = {}
+        for pos, attr_tuple in enumerate(zip(*v_attrs)):
+            lookup.setdefault(attr_tuple, []).append(self.idx.v[pos])
+
         idxes = []
         for v_search in zip(*values):
-            v_idx = []
-            for pos, v_attr in enumerate(zip(*v_attrs)):
-                if all([i == j for i, j in zip(v_search, v_attr)]):
-                    v_idx.append(self.idx.v[pos])
-            if not v_idx:
-                if allow_none is False:
-                    raise IndexError(f'No {self.class_name} device found matching {list(keys)}={v_search}')
-                else:
-                    v_idx = [default]
+            matches = lookup.get(v_search, [])
 
-            if allow_all:
-                idxes.append(v_idx)
-            else:
-                idxes.append(v_idx[0])
+            if not matches:
+                if not allow_none:
+                    raise IndexError(
+                        f'No {self.class_name} device found matching {list(keys)}={v_search}'
+                    )
+                matches = [default]
+
+            idxes.append(matches if allow_all else matches[0])
 
         return idxes
+    # def find_idx(self, keys, values, allow_none=False, default=False, allow_all=False):
+    #     """
+    #     Find `idx` of devices whose values match the given pattern.
+
+    #     Parameters
+    #     ----------
+    #     keys : str, array-like, Sized
+    #         A string or an array-like of strings containing the names of parameters for the search criteria
+    #     values : array, array of arrays, Sized
+    #         Values for the corresponding key to search for. If keys is a str, values should be an array of
+    #         elements. If keys is a list, values should be an array of arrays, each corresponds to the key.
+    #     allow_none : bool, Sized, optional
+    #         Allow key, value to be not found. Used by groups.
+    #     default : bool, optional
+    #         Default idx to return if not found (missing)
+    #     allow_all : bool, optional
+    #         If True, returns a list of lists where each nested list contains all the matches for the
+    #         corresponding search criteria.
+
+    #     Returns
+    #     -------
+    #     list
+    #         indices of devices
+
+    #     Notes
+    #     -----
+    #     - Only the first match is returned by default.
+    #     - If all matches are needed, set `allow_all` to True.
+
+    #     Examples
+    #     --------
+    #     >>> # Use example case of IEEE 14-bus system with PVD1
+    #     >>> ss = andes.load(andes.get_case('ieee14/ieee14_pvd1.xlsx'))
+
+    #     >>> # To find the idx of `PVD1` with `name` of 'PVD1_1' and 'PVD1_2'
+    #     >>> ss.PVD1.find_idx(keys='name', values=['PVD1_1', 'PVD1_2'])
+    #     [1, 2]
+
+    #     >>> # To find the idx of `PVD1` connected to bus 4
+    #     >>> ss.PVD1.find_idx(keys='bus', values=[4])
+    #     [1]
+
+    #     >>> # To find ALL the idx of `PVD1` with `gammap` equals to 0.1
+    #     >>> ss.PVD1.find_idx(keys='gammap', values=[0.1], allow_all=True)
+    #     [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+
+    #     >>> # To find the idx of `PVD1` with `gammap` equals to 0.1 and `name` of 'PVD1_1'
+    #     >>> ss.PVD1.find_idx(keys=['gammap', 'name'], values=[[0.1], ['PVD1_1']])
+    #     [1]
+    #     """
+
+    #     keys, values = validate_keys_values(keys, values)
+
+    #     v_attrs = [self.__dict__[key].v for key in keys]
+
+    #     idxes = []
+    #     for v_search in zip(*values):
+    #         v_idx = []
+    #         for pos, v_attr in enumerate(zip(*v_attrs)):
+    #             if all([i == j for i, j in zip(v_search, v_attr)]):
+    #                 v_idx.append(self.idx.v[pos])
+    #         if not v_idx:
+    #             if allow_none is False:
+    #                 raise IndexError(f'No {self.class_name} device found matching {list(keys)}={v_search}')
+    #             else:
+    #                 v_idx = [default]
+
+    #         if allow_all:
+    #             idxes.append(v_idx)
+    #         else:
+    #             idxes.append(v_idx[0])
+
+    #     return idxes
