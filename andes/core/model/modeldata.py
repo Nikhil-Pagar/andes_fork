@@ -308,6 +308,30 @@ class ModelData:
         return out
 
     def _get_busfreq_cached_matches(self, key, val):   # Extra function added by Nikhil
+        """
+        Retrieve cached `idx` matches for a single key/value search on the
+        ``BusFreq`` model, used internally by `find_idx` as a fast path.
+
+        Maintains a persistent cache at ``self.system._find_idx_cache``,
+        mapping each searched attribute value to its corresponding list of
+        device indices. The cache is rebuilt from scratch if the number of
+        devices has decreased (e.g., devices removed), and extended
+        incrementally (only new devices processed) if the number of devices
+        has increased. This avoids rebuilding the lookup table on every call
+        for a model that is queried very frequently with simple patterns.
+
+        Parameters
+        ----------
+        key : str
+            Name of the device attribute to search on (e.g., 'bus').
+        val : Any
+            The value to search for within the given attribute.
+
+        Returns
+        -------
+        list
+            List of matching device `idx` values. Empty list if no match found.
+        """
         if not hasattr(self.system, "_find_idx_cache"):
             self.system._find_idx_cache = {}
 
@@ -337,6 +361,60 @@ class ModelData:
         return key_cache["map"].get(val, [])
 
     def find_idx(self, keys, values, allow_none=False, default=False, allow_all=False):
+        """
+        Find `idx` of devices whose values match the given pattern.
+
+        Parameters
+        ----------
+        keys : str, array-like, Sized
+            A string or an array-like of strings containing the names of parameters for the search criteria
+        values : array, array of arrays, Sized
+            Values for the corresponding key to search for. If keys is a str, values should be an array of
+            elements. If keys is a list, values should be an array of arrays, each corresponds to the key.
+        allow_none : bool, Sized, optional
+            Allow key, value to be not found. Used by groups.
+        default : bool, optional
+            Default idx to return if not found (missing)
+        allow_all : bool, optional
+            If True, returns a list of lists where each nested list contains all the matches for the
+            corresponding search criteria.
+
+        Returns
+        -------
+        list
+            indices of devices
+
+        Notes
+        -----
+        - Only the first match is returned by default.
+        - If all matches are needed, set `allow_all` to True.
+        - Internally uses a hash-map lookup (O(n + m)) instead of a nested linear
+        scan for improved performance on large models. A persistent, incrementally
+        updated cache is additionally used for the ``BusFreq`` model via
+        `_get_busfreq_cached_matches`, since it is queried very frequently with
+        single key/value patterns during initialization.
+
+        Examples
+        --------
+        >>> # Use example case of IEEE 14-bus system with PVD1
+        >>> ss = andes.load(andes.get_case('ieee14/ieee14_pvd1.xlsx'))
+
+        >>> # To find the idx of `PVD1` with `name` of 'PVD1_1' and 'PVD1_2'
+        >>> ss.PVD1.find_idx(keys='name', values=['PVD1_1', 'PVD1_2'])
+        [1, 2]
+
+        >>> # To find the idx of `PVD1` connected to bus 4
+        >>> ss.PVD1.find_idx(keys='bus', values=[4])
+        [1]
+
+        >>> # To find ALL the idx of `PVD1` with `gammap` equals to 0.1
+        >>> ss.PVD1.find_idx(keys='gammap', values=[0.1], allow_all=True)
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+
+        >>> # To find the idx of `PVD1` with `gammap` equals to 0.1 and `name` of 'PVD1_1'
+        >>> ss.PVD1.find_idx(keys=['gammap', 'name'], values=[[0.1], ['PVD1_1']])
+        [1]
+        """
         keys, values = validate_keys_values(keys, values)
 
         # No devices in this model

@@ -116,10 +116,52 @@ def get_block_lines(b, mdata, cfg):
 
 
 def _get_cache_path(file):
+    """
+    Return the cache file path for a given RAW file.
+
+
+    The cache uses a `.pssecache` suffix appended to the original file
+    path. The extension name is arbitrary and only serves to distinguish
+    the cached binary from the original RAW input.
+
+    Parameters
+    ----------
+    file : str
+        Path to the source RAW file.
+
+    Returns
+    -------
+    str
+        Path to the corresponding cache file.
+    """
     return file + '.pssecache'
 
 
 def _is_cache_valid(source_file, cache_path, addfiles=None):
+    """
+    Check whether an existing cache file is valid and up to date.
+
+    A cache is considered valid if it exists and its modification time is
+    not older than the source RAW file (and, if provided, not older than
+    any of the additional dependent files). This prevents stale caches
+    from being used after the source file has been edited.
+
+    Parameters
+    ----------
+    source_file : str
+        Path to the source RAW file.
+    cache_path : str
+        Path to the cache file to validate.
+    addfiles : list of str, optional
+        Additional file paths whose modification times should also be
+        checked against the cache.
+
+    Returns
+    -------
+    bool
+        True if the cache file exists and is at least as recent as the
+        source file (and any `addfiles`), False otherwise.
+    """
     if not os.path.exists(cache_path):
         return False
     cache_mtime = os.path.getmtime(cache_path)
@@ -133,11 +175,36 @@ def _is_cache_valid(source_file, cache_path, addfiles=None):
 
 
 def _save_cache(cache_path, data):
+    """
+    Serialize parsed RAW data to a binary cache file using pickle.
+
+    Parameters
+    ----------
+    cache_path : str
+        Destination path for the cache file.
+    data : dict
+        Data to serialize (expected keys: 'raw', 'mva', 'freq', 'version').
+    """
     with open(cache_path, 'wb') as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _load_cache(cache_path):
+    """
+    Load previously cached parsed RAW data from a binary cache file.
+
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the cache file to load.
+
+    Returns
+    -------
+    dict
+        Deserialized data dictionary (expected keys: 'raw', 'mva',
+        'freq', 'version').
+    """
     with open(cache_path, 'rb') as f:
         return pickle.load(f)
 
@@ -238,8 +305,25 @@ def _split_line_with_quoted_parts(line, separator='/'):
 
 def _parse_raw_file(file):
     """
-    Parse PSS/E raw file text and return raw data dict, mva, freq, version.
-    This is the expensive text parsing part that gets cached.
+    Parse a PSS/E RAW file's text content into an intermediate dictionary.
+
+    This function performs the expensive line-by-line text parsing stage
+    (block detection, quoted-field splitting, numeric conversion) that was
+    previously inline within `read()`. Separating it out allows the parsed
+    result to be cached and reused across runs via `read()`.
+
+    Parameters
+    ----------
+    file : str or file-like
+        Path to the RAW file, or a file-like object.
+
+    Returns
+    -------
+    tuple
+        (raw, mva, freq, version) where `raw` is a dict mapping block
+        names (e.g., 'bus', 'load', 'branch') to lists of parsed device
+        data, `mva` is the system base MVA, `freq` is the nominal system
+        frequency, and `version` is the detected RAW file version.
     """
     mva = 100
     freq = 60.0
@@ -310,7 +394,31 @@ def _parse_raw_file(file):
 def read(system, file):
     """
     Read PSS/E RAW file v32/v33/v34 formats.
-    Uses cache if available and valid.
+
+    Parameters
+    ----------
+    system : System
+        System instance to which parsed data will be loaded.
+    file : str or os.PathLike or file-like
+        Path to the RAW file. Caching is only enabled when `file` is an
+        actual path (str or os.PathLike); file-like objects bypass caching.
+
+    Returns
+    -------
+    bool
+        True if parsing succeeded.
+
+    Notes
+    -----
+    - If a valid `.pssecache` file exists for `file` (see `_is_cache_valid`),
+    the expensive text-parsing stage is skipped and the cached parsed
+    data is loaded directly via `_load_cache`.
+    - Otherwise, the file is parsed via `_parse_raw_file`, and the result
+    is saved to a `.pssecache` file for reuse on subsequent runs.
+    - Cache load/save failures are logged as warnings and do not interrupt
+    execution; parsing falls back to the standard (non-cached) path.
+    - System object construction (bus, load, generator, line, transformer,
+    shunt, area parsing) is unchanged from the original implementation.
     """
     ret = True
 
@@ -398,16 +506,39 @@ def _read_dyr_dict(file):
     return dyr_dict
 
 
-# addded by Nikhil:
+# # addded by Nikhil:
 
-def _norm_id(x):
-    return str(x).strip().strip("'").strip('"')
+# def _norm_id(x):
+#     return str(x).strip().strip("'").strip('"')
 
 
 def _filter_offline_dyr_models(system, dyr_dict):
     """
-    Remove DYR rows for generators that were offline in RAW.
-    Matching key is (bus, machine_id).
+    Remove DYR rows corresponding to generators that are offline in RAW.
+    Generators with STAT == 0 in the RAW file are skipped during static
+    device construction (see `_parse_gen_v33`) and recorded in
+    `system._offline_gens` as (bus, machine_id) tuples. This function uses
+    that set to drop matching rows from each DYR model's DataFrame, so that
+    dynamic model data is not instantiated for generators that do not
+    exist as static devices.
+
+    Matching key is (bus, machine_id), read from the first two columns of
+    each DYR model's DataFrame.
+
+    Parameters
+    ----------
+    system : System
+        System instance containing `_offline_gens` (populated during RAW
+        parsing).
+    dyr_dict : dict
+        Dict mapping PSS/E dynamic model names to their parsed DataFrame
+        of device rows.
+
+    Returns
+    -------
+    dict
+        Filtered `dyr_dict` with rows referencing offline generators removed.
+        Models with empty data or fewer than 2 columns are returned unchanged.
     """
     offline_gens = getattr(system, '_offline_gens', set())
     if not offline_gens:
@@ -451,7 +582,6 @@ def _filter_offline_dyr_models(system, dyr_dict):
 def read_add(system, file):
     """
     Read an addition PSS/E dyr file.
-
     Parameters
     ----------
     system : System
@@ -463,6 +593,13 @@ def read_add(system, file):
     -------
     bool
         data parsing status
+
+    Notes
+    -----
+    - Rows referencing generators marked offline in the RAW file (STAT == 0)
+    are filtered out via `_filter_offline_dyr_models` before dynamic
+    model construction, to keep DYR data consistent with the static
+    generator set.
     """
     # original code
     # dyr_dict = _read_dyr_dict(file)
@@ -664,6 +801,13 @@ def _parse_fshunt_v33(raw, system):
 def _parse_gen_v33(raw, system, sw):
     """
     Helper function for parsing static generator section.
+
+    Notes
+    -----
+    Generators with STAT == 0 (offline) are excluded from device
+    construction. Their (bus, subidx) pairs are recorded in
+    `system._offline_gens` so that corresponding DYR dynamic model rows
+    can be filtered out later via `_filter_offline_dyr_models`.
     """
 
     # 0,  1,  2,  3,  4,  5,  6,    7,     8,  9, 10, 11, 12,   13,   14,
@@ -757,6 +901,38 @@ def _parse_line(raw, system, cfg):
 
 
 def _parse_transf_v33(raw, system, max_bus):
+    """
+    Parse 2-winding and 3-winding transformer data into `Line` (and,
+    for 3-winding transformers, auxiliary `Bus`) device parameters.
+
+    Parameters
+    ----------
+    raw : dict
+        Parsed RAW data blocks, as returned by `_parse_raw_file`.
+    system : System
+        System instance to which transformer-derived `Line`/`Bus` devices
+        will be added.
+    max_bus : int
+        Maximum existing bus index, used to assign a non-conflicting
+        auxiliary bus index for 3-winding transformer star points.
+
+    Returns
+    -------
+    tuple
+        (out, xf_3_count) where `out` is a dict of device parameters added
+        to `system`, and `xf_3_count` is the count of 3-winding transformers
+        processed (used for auxiliary bus index assignment).
+
+    Notes
+    -----
+    Bus attribute lookups (Vn, area, zone, owner) are precomputed into
+    local dictionaries (`bus_vn`, `bus_area`, `bus_zone`, `bus_owner`)
+    before the main loop, instead of calling `system.Bus.get()` per
+    transformer record, to reduce repeated lookup overhead for large
+    systems. Numerical conversion logic (CW/CZ/CM codes, impedance and
+    magnetizing admittance calculations) is unchanged from the original
+    implementation.
+    """
     out = defaultdict(list)
     xf_3_count = 1
 
