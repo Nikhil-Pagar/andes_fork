@@ -137,27 +137,78 @@ class ConnMan:
 
         return fr, to, u
 
-    def _find_islanded_buses(self, n, fr, to, u):
+    def _find_islanded_buses(self, n, fr, to, u):  # changes by Nikhil
         """
         Find buses with zero active connections (degree-zero nodes).
-
         Sets ``Bus.islanded_buses``, ``Bus.islanded_a``,
         ``Bus.islanded_v``, and ``Bus.n_islanded_buses``.
+
+        Parameters
+        ----------
+        n : int
+            Total number of buses in the system.
+        fr : list
+            From-bus address indices collected from branch models.
+        to : list
+            To-bus address indices collected from branch models.
+        u : list
+            Effective online status for each branch entry in `fr`/`to`.
+
+        Notes
+        -----
+        - If all branches are active (``u`` fully nonzero), connectivity is
+        determined directly via boolean marking of buses present in `fr`/`to`
+        and `np.flatnonzero`, avoiding sparse matrix construction entirely.
+        This is the common case for a fully energized system.
+        - If one or more branches are inactive, falls back to the original
+        sparse degree-vector approach (`spmatrix` summation) to correctly
+        account for branch status.
+        - Both paths produce identical results; the fast path only changes
+        how the all-active case is computed, not the outcome.
         """
         Bus = self.system.Bus
+        u_arr = np.asarray(u)
 
-        os = [0] * len(u)
+        if np.all(u_arr != 0):
+            connected = np.zeros(n, dtype=bool)
+            connected[np.asarray(fr, dtype=int)] = True
+            connected[np.asarray(to, dtype=int)] = True
+            islanded = np.flatnonzero(~connected)
+        else:
+            os = [0] * len(u)
+            degree_sp = sparse(
+                spmatrix(u, to, os, (n, 1), 'd') +
+                spmatrix(u, fr, os, (n, 1), 'd')
+            )
+            connected = set(int(i) for i in degree_sp.I)
+            islanded = np.array([i for i in range(n) if i not in connected], dtype=int)
 
-        # find islanded buses from sparse degree vector (avoid dense allocation)
-        degree_sp = sparse(spmatrix(u, to, os, (n, 1), 'd') +
-                           spmatrix(u, fr, os, (n, 1), 'd'))
-        connected = set(int(i) for i in degree_sp.I)
-        Bus.islanded_buses = [i for i in range(n) if i not in connected]
+        Bus.islanded_buses = islanded.tolist()
+        Bus.islanded_a = islanded
+        Bus.islanded_v = Bus.n + islanded
+        Bus.n_islanded_buses = islanded.size
 
-        # store `a` and `v` indices for zeroing out residuals
-        Bus.islanded_a = np.array(Bus.islanded_buses)
-        Bus.islanded_v = Bus.n + Bus.islanded_a
-        Bus.n_islanded_buses = len(Bus.islanded_a)
+    # def _find_islanded_buses(self, n, fr, to, u):
+    #     """
+    #     Find buses with zero active connections (degree-zero nodes).
+
+    #     Sets ``Bus.islanded_buses``, ``Bus.islanded_a``,
+    #     ``Bus.islanded_v``, and ``Bus.n_islanded_buses``.
+    #     """
+    #     Bus = self.system.Bus
+
+    #     os = [0] * len(u)
+
+    #     # find islanded buses from sparse degree vector (avoid dense allocation)
+    #     degree_sp = sparse(spmatrix(u, to, os, (n, 1), 'd') +
+    #                        spmatrix(u, fr, os, (n, 1), 'd'))
+    #     connected = set(int(i) for i in degree_sp.I)
+    #     Bus.islanded_buses = [i for i in range(n) if i not in connected]
+
+    #     # store `a` and `v` indices for zeroing out residuals
+    #     Bus.islanded_a = np.array(Bus.islanded_buses)
+    #     Bus.islanded_v = Bus.n + Bus.islanded_a
+    #     Bus.n_islanded_buses = len(Bus.islanded_a)
 
     def _find_islands(self, n, fr, to, u):
         """

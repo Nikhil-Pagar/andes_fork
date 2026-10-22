@@ -6,6 +6,7 @@ Include a RAW parser and a DYR parser.
 
 import logging
 import os
+import pickle
 import yaml
 
 import andes.io
@@ -111,6 +112,102 @@ def get_block_lines(b, mdata, cfg):
 
     return cfg['line_counts'][b]
 
+# added by Nikhil : the following helper function and changes
+
+
+def _get_cache_path(file):
+    """
+    Return the cache file path for a given RAW file.
+
+
+    The cache uses a `.pssecache` suffix appended to the original file
+    path. The extension name is arbitrary and only serves to distinguish
+    the cached binary from the original RAW input.
+
+    Parameters
+    ----------
+    file : str
+        Path to the source RAW file.
+
+    Returns
+    -------
+    str
+        Path to the corresponding cache file.
+    """
+    return file + '.pssecache'
+
+
+def _is_cache_valid(source_file, cache_path, addfiles=None):
+    """
+    Check whether an existing cache file is valid and up to date.
+
+    A cache is considered valid if it exists and its modification time is
+    not older than the source RAW file (and, if provided, not older than
+    any of the additional dependent files). This prevents stale caches
+    from being used after the source file has been edited.
+
+    Parameters
+    ----------
+    source_file : str
+        Path to the source RAW file.
+    cache_path : str
+        Path to the cache file to validate.
+    addfiles : list of str, optional
+        Additional file paths whose modification times should also be
+        checked against the cache.
+
+    Returns
+    -------
+    bool
+        True if the cache file exists and is at least as recent as the
+        source file (and any `addfiles`), False otherwise.
+    """
+    if not os.path.exists(cache_path):
+        return False
+    cache_mtime = os.path.getmtime(cache_path)
+    if os.path.getmtime(source_file) > cache_mtime:
+        return False
+    if addfiles:
+        for f in addfiles:
+            if os.path.exists(f) and os.path.getmtime(f) > cache_mtime:
+                return False
+    return True
+
+
+def _save_cache(cache_path, data):
+    """
+    Serialize parsed RAW data to a binary cache file using pickle.
+
+    Parameters
+    ----------
+    cache_path : str
+        Destination path for the cache file.
+    data : dict
+        Data to serialize (expected keys: 'raw', 'mva', 'freq', 'version').
+    """
+    with open(cache_path, 'wb') as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _load_cache(cache_path):
+    """
+    Load previously cached parsed RAW data from a binary cache file.
+
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the cache file to load.
+
+    Returns
+    -------
+    dict
+        Deserialized data dictionary (expected keys: 'raw', 'mva',
+        'freq', 'version').
+    """
+    with open(cache_path, 'rb') as f:
+        return pickle.load(f)
+
 
 def _parse_csv_with_quotes(line):
     """
@@ -206,23 +303,37 @@ def _split_line_with_quoted_parts(line, separator='/'):
     return result
 
 
-def read(system, file):
+def _parse_raw_file(file):
     """
-    Read PSS/E RAW file v32/v33/v34 formats.
-    """
+    Parse a PSS/E RAW file's text content into an intermediate dictionary.
 
-    ret = True
+    This function performs the expensive line-by-line text parsing stage
+    (block detection, quoted-field splitting, numeric conversion) that was
+    previously inline within `read()`. Separating it out allows the parsed
+    result to be cached and reused across runs via `read()`.
+
+    Parameters
+    ----------
+    file : str or file-like
+        Path to the RAW file, or a file-like object.
+
+    Returns
+    -------
+    tuple
+        (raw, mva, freq, version) where `raw` is a dict mapping block
+        names (e.g., 'bus', 'load', 'branch') to lists of parsed device
+        data, `mva` is the system base MVA, `freq` is the nominal system
+        frequency, and `version` is the detected RAW file version.
+    """
     mva = 100
+    freq = 60.0
     version = 0
-
     data = []
-    mdata = []  # multi-line data
-    dev_line = 0  # line counter for multi-line models
+    mdata = []
+    dev_line = 0
 
-    # read file into `line_list`
     line_list = andes.io.read_file_like(file)
 
-    # detect version from header
     if line_list:
         first_parts = _split_line_with_quoted_parts(line_list[0].strip())
         first_data = _parse_csv_with_quotes(first_parts[0])
@@ -232,39 +343,35 @@ def read(system, file):
     cfg = _VERSION_CONFIGS.get(version, _VERSION_CONFIGS[33])
     blocks = cfg['blocks']
     block_idx = cfg['initial_block_idx']
-
     raw = {item: [] for item in blocks}
 
-    # parse file into `raw` with to_number conversions
     for num, line in enumerate(line_list):
         line = line.strip()
-        # get basemva and nominal frequency
+
         if num == 0:
             parts = _split_line_with_quoted_parts(line)
             data = _parse_csv_with_quotes(parts[0])
-
             mva = float(data[1])
-            system.config.mva = mva
             try:
-                system.config.freq = float(data[5])
+                freq = float(data[5])
             except (IndexError, ValueError):
                 logger.debug('System frequency not specified in RAW header. '
                              'Defaulting to 60 Hz.')
-                system.config.freq = 60.0
-
+                freq = 60.0
             continue
 
-        elif num == 1 or num == 2:  # store the case info line
+        elif num == 1 or num == 2:
             if len(line) > 0:
                 logger.info("  " + line)
             continue
+
         elif num >= 3:
-            if line[0:2] == '0 ' or line[0:3] == ' 0 ':  # end of block
+            if line[0:2] == '0 ' or line[0:3] == ' 0 ':
                 block_idx += 1
                 continue
-            elif line[0] == 'Q':  # end of file
+            elif line[0] == 'Q':
                 break
-            elif line.startswith('@!'):  # v34 column header line
+            elif line.startswith('@!'):
                 continue
             parts = _split_line_with_quoted_parts(line)
             data = _parse_csv_with_quotes(parts[0])
@@ -281,7 +388,72 @@ def read(system, file):
             mdata = []
             dev_line = 0
 
-    # add device elements to system
+    return raw, mva, freq, version
+
+
+def read(system, file):
+    """
+    Read PSS/E RAW file v32/v33/v34 formats.
+
+    Parameters
+    ----------
+    system : System
+        System instance to which parsed data will be loaded.
+    file : str or os.PathLike or file-like
+        Path to the RAW file. Caching is only enabled when `file` is an
+        actual path (str or os.PathLike); file-like objects bypass caching.
+
+    Returns
+    -------
+    bool
+        True if parsing succeeded.
+
+    Notes
+    -----
+    - If a valid `.pssecache` file exists for `file` (see `_is_cache_valid`),
+    the expensive text-parsing stage is skipped and the cached parsed
+    data is loaded directly via `_load_cache`.
+    - Otherwise, the file is parsed via `_parse_raw_file`, and the result
+    is saved to a `.pssecache` file for reuse on subsequent runs.
+    - Cache load/save failures are logged as warnings and do not interrupt
+    execution; parsing falls back to the standard (non-cached) path.
+    - System object construction (bus, load, generator, line, transformer,
+    shunt, area parsing) is unchanged from the original implementation.
+    """
+    ret = True
+
+    # Caching only works when `file` is an actual path, not an open file object
+    use_cache = isinstance(file, (str, os.PathLike))
+    cache_path = _get_cache_path(file) if use_cache else None
+
+    if use_cache and _is_cache_valid(file, cache_path):
+        logger.info('Loading PSS/E cache from: %s', cache_path)
+        try:
+            cached = _load_cache(cache_path)
+            raw = cached['raw']
+            mva = cached['mva']
+            freq = cached['freq']
+            version = cached['version']
+            logger.info('PSS/E cache loaded successfully.')
+        except Exception as e:
+            logger.warning('Cache load failed (%s). Re-parsing.', e)
+            raw, mva, freq, version = _parse_raw_file(file)
+            _save_cache(cache_path, {'raw': raw, 'mva': mva,
+                                     'freq': freq, 'version': version})
+    else:
+        raw, mva, freq, version = _parse_raw_file(file)
+        try:
+            _save_cache(cache_path, {'raw': raw, 'mva': mva,
+                                     'freq': freq, 'version': version})
+            logger.info('PSS/E cache saved to: %s', cache_path)
+        except Exception as e:
+            logger.warning('Cache save failed (%s). Continuing.', e)
+
+    system.config.mva = mva
+    system.config.freq = freq
+
+    cfg = _VERSION_CONFIGS.get(version, _VERSION_CONFIGS[33])
+
     bus_params, bus_idx_list, sw = _parse_bus_v33(raw, system)
     max_bus = max(bus_idx_list)
 
@@ -334,10 +506,82 @@ def _read_dyr_dict(file):
     return dyr_dict
 
 
+# # addded by Nikhil:
+
+# def _norm_id(x):
+#     return str(x).strip().strip("'").strip('"')
+
+
+def _filter_offline_dyr_models(system, dyr_dict):
+    """
+    Remove DYR rows corresponding to generators that are offline in RAW.
+    Generators with STAT == 0 in the RAW file are skipped during static
+    device construction (see `_parse_gen_v33`) and recorded in
+    `system._offline_gens` as (bus, machine_id) tuples. This function uses
+    that set to drop matching rows from each DYR model's DataFrame, so that
+    dynamic model data is not instantiated for generators that do not
+    exist as static devices.
+
+    Matching key is (bus, machine_id), read from the first two columns of
+    each DYR model's DataFrame.
+
+    Parameters
+    ----------
+    system : System
+        System instance containing `_offline_gens` (populated during RAW
+        parsing).
+    dyr_dict : dict
+        Dict mapping PSS/E dynamic model names to their parsed DataFrame
+        of device rows.
+
+    Returns
+    -------
+    dict
+        Filtered `dyr_dict` with rows referencing offline generators removed.
+        Models with empty data or fewer than 2 columns are returned unchanged.
+    """
+    offline_gens = getattr(system, '_offline_gens', set())
+    if not offline_gens:
+        return dyr_dict
+
+    filtered = {}
+
+    for model_name, df in dyr_dict.items():
+        if df.empty:
+            filtered[model_name] = df
+            continue
+
+        # only try if at least two columns exist
+        if df.shape[1] < 2:
+            filtered[model_name] = df
+            continue
+
+        keep_rows = []
+        for i in range(len(df)):
+            try:
+                bus = int(df.iloc[i, 0])
+                # mach = str(df.iloc[i, 1]).strip()
+                # mach = _norm_id(df.iloc[i, 1])
+                mach = df.iloc[i, 1]
+            except Exception:
+                keep_rows.append(True)
+                continue
+
+            if (bus, mach) in offline_gens:
+                logger.info("Skipping DYR model %s for offline generator (%s, %s)",
+                            model_name, bus, mach)
+                keep_rows.append(False)
+            else:
+                keep_rows.append(True)
+
+        filtered[model_name] = df.loc[keep_rows].reset_index(drop=True)
+
+    return filtered
+
+
 def read_add(system, file):
     """
     Read an addition PSS/E dyr file.
-
     Parameters
     ----------
     system : System
@@ -349,8 +593,21 @@ def read_add(system, file):
     -------
     bool
         data parsing status
+
+    Notes
+    -----
+    - Rows referencing generators marked offline in the RAW file (STAT == 0)
+    are filtered out via `_filter_offline_dyr_models` before dynamic
+    model construction, to keep DYR data consistent with the static
+    generator set.
     """
+    # original code
+    # dyr_dict = _read_dyr_dict(file)
+    # system.dyr_dict = dyr_dict
+
+    # added by Nikhil: the 3 lines below this
     dyr_dict = _read_dyr_dict(file)
+    dyr_dict = _filter_offline_dyr_models(system, dyr_dict)
     system.dyr_dict = dyr_dict
 
     # read yaml and set header for each pss/e model
@@ -544,6 +801,13 @@ def _parse_fshunt_v33(raw, system):
 def _parse_gen_v33(raw, system, sw):
     """
     Helper function for parsing static generator section.
+
+    Notes
+    -----
+    Generators with STAT == 0 (offline) are excluded from device
+    construction. Their (bus, subidx) pairs are recorded in
+    `system._offline_gens` so that corresponding DYR dynamic model rows
+    can be filtered out later via `_filter_offline_dyr_models`.
     """
 
     # 0,  1,  2,  3,  4,  5,  6,    7,     8,  9, 10, 11, 12,   13,   14,
@@ -563,8 +827,26 @@ def _parse_gen_v33(raw, system, sw):
         subidx = data[1]
         vn = system.Bus.get(src='Vn', idx=bus, attr='v')
         gen_mva = data[8]
-        gen_idx += 1
+        # the follwoing is original code
+        # gen_idx += 1
+        # status = data[14]
+
+        # # modified by Nikhil
+        ##############################
         status = data[14]
+        # # subidx = str(data[1]).strip()
+        # subidx = _norm_id(data[1])
+        subidx = data[1]
+
+        if not hasattr(system, '_offline_gens'):
+            system._offline_gens = set()
+
+        if status == 0:
+            system._offline_gens.add((bus, subidx))
+            continue
+
+        gen_idx += 1
+        ##############################
         wmod = data[26] if len(data) > 26 else 0
 
         param = {'Sn': gen_mva, 'Vn': vn, 'u': status,
@@ -615,237 +897,228 @@ def _parse_line(raw, system, cfg):
 
     return out
 
+# This is modified version by Nikhil
+
 
 def _parse_transf_v33(raw, system, max_bus):
+    """
+    Parse 2-winding and 3-winding transformer data into `Line` (and,
+    for 3-winding transformers, auxiliary `Bus`) device parameters.
 
+    Parameters
+    ----------
+    raw : dict
+        Parsed RAW data blocks, as returned by `_parse_raw_file`.
+    system : System
+        System instance to which transformer-derived `Line`/`Bus` devices
+        will be added.
+    max_bus : int
+        Maximum existing bus index, used to assign a non-conflicting
+        auxiliary bus index for 3-winding transformer star points.
+
+    Returns
+    -------
+    tuple
+        (out, xf_3_count) where `out` is a dict of device parameters added
+        to `system`, and `xf_3_count` is the count of 3-winding transformers
+        processed (used for auxiliary bus index assignment).
+
+    Notes
+    -----
+    Bus attribute lookups (Vn, area, zone, owner) are precomputed into
+    local dictionaries (`bus_vn`, `bus_area`, `bus_zone`, `bus_owner`)
+    before the main loop, instead of calling `system.Bus.get()` per
+    transformer record, to reduce repeated lookup overhead for large
+    systems. Numerical conversion logic (CW/CZ/CM codes, impedance and
+    magnetizing admittance calculations) is unchanged from the original
+    implementation.
+    """
     out = defaultdict(list)
     xf_3_count = 1
 
+    # local shortcuts for speed
+    system_mva = system.config.mva
+
+    bus_idx = list(system.Bus.idx.v)
+    bus_idx_set = set(bus_idx)
+    bus_vn = dict(zip(bus_idx, system.Bus.Vn.v))
+    bus_area = dict(zip(bus_idx, system.Bus.area.v))
+    bus_zone = dict(zip(bus_idx, system.Bus.zone.v))
+    bus_owner = dict(zip(bus_idx, system.Bus.owner.v))
+
     for data in raw['transf']:
+        hdr = data[0]
+
         if len(data) == 4:
+            d1 = data[1]
+            w1 = data[2]
+            w2 = data[3]
 
-            # """
-            # I,J,K,CKT,CW,CZ,CM,MAG1,MAG2,NMETR,'NAME',STAT,O1,F1,...,O4,F4
-            # R1-2,X1-2,SBASE1-2
-            # WINDV1,NOMV1,ANG1,RATA1,RATB1,RATC1,COD1,CONT1,RMA1,RMI1,VMA1,VMI1,NTP1,TAB1,CR1,CX1
-            # WINDV2,NOMV2
-            #
-            # """
+            bus1 = hdr[0]
+            bus2 = hdr[1]
+            cw = hdr[4]
+            cz = hdr[5]
+            cm = hdr[6]
+            u = hdr[11]
 
-            bus_Vn1 = system.Bus.get(src='Vn', idx=data[0][0], attr='v')
-            bus_Vn2 = system.Bus.get(src='Vn', idx=data[0][1], attr='v')
+            bus_Vn1 = bus_vn[bus1]
+            bus_Vn2 = bus_vn[bus2]
 
-            Vn1 = data[2][1] if data[2][1] != 0.0 else bus_Vn1
-            Vn2 = data[3][1] if data[3][1] != 0.0 else bus_Vn2
-            transf = True
-            tap = data[2][0]  # pu or in kV
-            phi = data[2][2] * deg2rad  # `ANG1` is entered in degree; convert to rad
-            rate_a = data[2][3]
-            rate_b = data[2][4]
-            rate_c = data[2][5]
+            Vn1 = w1[1] if w1[1] != 0.0 else bus_Vn1
+            Vn2 = w2[1] if w2[1] != 0.0 else bus_Vn2
 
-            # CW - Winding I/O code, 1-turn ratio on pu bus base kV, 2: winding V, 3: turn ratio pu on norn wind V
-            if data[0][4] == 2:
-                tap = (data[2][0] / bus_Vn1) / (data[3][0] / bus_Vn2)
-            elif data[0][4] == 3:
+            tap = w1[0]
+            phi = w1[2] * deg2rad
+            rate_a = w1[3]
+            rate_b = w1[4]
+            rate_c = w1[5]
+
+            # CW
+            if cw == 2:
+                tap = (w1[0] / bus_Vn1) / (w2[0] / bus_Vn2)
+            elif cw == 3:
                 tap = tap * (Vn1 / bus_Vn1) / (Vn2 / bus_Vn2)
 
-            # PSS/E convention: WINDV=0 means use nominal (1.0 per-unit tap ratio)
             if tap == 0.0:
                 tap = 1.0
 
-            # CZ - Z code, 1-system base, 2-winding base, 3-load loss and |z|
-            if data[0][5] == 1:
-                Sn = system.config.mva
-            elif data[0][5] == 2:
-                Sn = data[1][2]
-            elif data[0][5] == 3:
-                # CZ=3: Load loss & |Z|
-                # Convert power loss and impedance magnitude to R and X on winding base
-                Sn = data[1][2]  # Use winding base MVA
+            # CZ
+            if cz == 1:
+                Sn = system_mva
+            elif cz == 2:
+                Sn = d1[2]
+            elif cz == 3:
+                Sn = d1[2]
+                r_pu_wb = d1[0] / (Sn * 1e6)
+                z2 = d1[1] * d1[1]
+                r2 = r_pu_wb * r_pu_wb
 
-                # Convert load loss (W) to R (pu on winding base)
-                # R = W / (SBASE_winding * 1e6)
-                r_pu_wb = data[1][0] / (Sn * 1e6)
-
-                # Calculate X from |Z| and R: X = sqrt(|Z|^2 - R^2)
-                # Handle numeric issues - ensure we don't get imaginary numbers
-                if data[1][1]**2 > r_pu_wb**2:
-                    x_pu_wb = (data[1][1]**2 - r_pu_wb**2)**0.5
+                if z2 > r2:
+                    x_pu_wb = (z2 - r2) ** 0.5
                 else:
-                    # If |Z| is too small compared to R, assume X is very small
-                    logger.warning(f"Branch {data[0][0]}-{data[0][1]}:")
+                    logger.warning(f"Branch {bus1}-{bus2}:")
                     logger.warning("  CZ=3 conversion issue: |Z|^2 < R^2. Setting X to small value.")
                     x_pu_wb = 1e-6
 
-                # Replace the data[1][0] and data[1][1] with calculated R and X
-                data[1][0] = r_pu_wb
-                data[1][1] = x_pu_wb
-
-                # Now it's in CZ=2 format and will be processed accordingly
+                d1[0] = r_pu_wb
+                d1[1] = x_pu_wb
             else:
-                logger.warning('Unknown impedance code %s', data[0][5])
+                logger.warning('Unknown impedance code %s', cz)
+                Sn = system_mva
 
-            # CM - Y code, 1-system base, 2-No load loss and exc. loss
-            if data[0][6] == 2:
-                # CM=2: No load loss & exc. loss
-                mag1 = data[0][7]  # No-load loss in watts
-                mag2 = data[0][8]  # Excitation current in pu
+            # CM
+            if cm == 2:
+                mag1 = hdr[7]
+                mag2 = hdr[8]
 
-                # Vbase for winding 1 (kV)
-                Vn1 = data[2][1] if data[2][1] != 0.0 else bus_Vn1
+                g_s = mag1 / (Vn1 * Vn1) / 1e6
+                y_mag_s = abs(mag2) * system_mva / (Vn1 * Vn1)
 
-                # Step 1: Convert power loss to conductance (G) in Siemens
-                # G [S] = MAG1 / VNOM1_kV^2 / 1e6
-                g_s = mag1 / (Vn1 ** 2) / 1e6
-
-                # Step 2: Calculate B in Siemens from excitation current
-                # First convert excitation current to |Y| in Siemens
-                y_mag_s = abs(mag2) * system.config.mva / (Vn1**2)
-
-                # B [S] = sqrt(|Y|^2 - G^2)
-                # Handle numeric issues
-                if y_mag_s**2 > g_s**2:
-                    b_s = (y_mag_s**2 - g_s**2)**0.5
-                    logger.info(f"CM=2 Conversion ok: G={g_s}, B={b_s}")
+                if y_mag_s * y_mag_s > g_s * g_s:
+                    b_s = (y_mag_s * y_mag_s - g_s * g_s) ** 0.5
                 else:
-                    # If |Y| is too small compared to G, assume B is very small
                     logger.warning("CM=2 conversion issue: |Y|^2 < G^2. Setting B to small value.")
                     b_s = 1e-6
 
-                # Convert back to per unit on system base
-                g_pu = g_s * (Vn1**2) / system.config.mva
-                b_pu = b_s * (Vn1**2) / system.config.mva
+                hdr[7] = g_s * (Vn1 * Vn1) / system_mva
+                hdr[8] = b_s * (Vn1 * Vn1) / system_mva
+            elif cm != 1:
+                logger.warning('Unknown magnetizing admittance code %s', cm)
 
-                # Replace MAG1 and MAG2 with calculated G and B in pu
-                data[0][7] = g_pu
-                data[0][8] = b_pu
-            elif data[0][6] != 1:
-                logger.warning('Unknown magnetizing admittance code %s', data[0][6])
-
-            param = {'bus1': data[0][0],
-                     'bus2': data[0][1],
-                     'u': data[0][11],
-                     'b': data[0][8],
-                     'r': data[1][0],
-                     'x': data[1][1],
-                     'trans': transf,
-                     'tap': tap,
-                     'phi': phi,
-                     'Sn': Sn,
-                     'Vn1': Vn1,
-                     'Vn2': Vn2,
-                     'rate_a': rate_a,
-                     'rate_b': rate_b,
-                     'rate_c': rate_c,
-                     }
-
-            out['Line'].append(param)
+            out['Line'].append({
+                'bus1': bus1,
+                'bus2': bus2,
+                'u': u,
+                'b': hdr[8],
+                'r': d1[0],
+                'x': d1[1],
+                'trans': True,
+                'tap': tap,
+                'phi': phi,
+                'Sn': Sn,
+                'Vn1': Vn1,
+                'Vn2': Vn2,
+                'rate_a': rate_a,
+                'rate_b': rate_b,
+                'rate_c': rate_c,
+            })
 
         else:
-
-            # I, J, K, CKT, CW, CZ, CM, MAG1, MAG2, NMETR, 'NAME', STAT, Ol, Fl,...,o4, F4
-            # R1-2, X1-2, SBASE1-2, R2-3, X2-3, SBASE2-3, R3-1, X3-1, SBASE3-1, VMSTAR, ANSTAR
-            # WINDV1, NOMV1, ANG1, RATA1, BATB1, RATC1, COD1, CONT1, RMA1, RMI1, VMA1, VMI1, NTP1, TAB1, CR1, CX1
-            # WINDV2, NOMV2, ANG2, RATA2, BATB2, RATC2, COD2, CONT2, RMA2, RMI2, VMA2, VMI2, NTP2, TAB2, CR2, CX2
-            # WINDV3, NOMV3, ANG3, RATA3, BATB3, RATC3, COD3, CONT3, RMA3, RMI3, VMA3, VMI3, NTP3, TAB3, CR3, CX3
-
-            # Process CZ=3 and CM=2 for 3-winding transformers
-            if data[0][5] == 3:  # CZ=3
+            if hdr[5] == 3:
                 data = _process_3wt_cz3(data, system)
-                # After processing, treat this as CZ=2
                 data[0][5] = 2
 
-            if data[0][6] == 2:  # CM=2
+            if data[0][6] == 2:
                 data = _process_3wt_cm2(data, system)
-                # After processing, treat this as CM=1
                 data[0][6] = 1
 
-            new_bus = data[0][2] + 1
+            hdr = data[0]
+            d1 = data[1]
 
-            if new_bus in system.Bus.idx.v:
+            bus1 = hdr[0]
+            bus2 = hdr[1]
+            bus3 = hdr[2]
+
+            new_bus = bus3 + 1
+            if new_bus in bus_idx_set:
                 new_bus = max_bus + xf_3_count
                 logger.debug('Added bus <%s> for 3-winding transformer <%s-%s-%s>',
-                             new_bus, data[0][0], data[0][1], data[0][2])
+                             new_bus, bus1, bus2, bus3)
 
-            # Assign `area`, `owner`, and `zone` using the high-voltage side bus values
-            high_voltage_bus = data[0][0]
-            area = system.Bus.get(src='area', attr='v', idx=high_voltage_bus)
-            zone = system.Bus.get(src='zone', attr='v', idx=high_voltage_bus)
-            owner = system.Bus.get(src='owner', attr='v', idx=high_voltage_bus)
+            out['Bus'].append({
+                'idx': new_bus,
+                'name': f'{bus1}_{bus2}_{bus3}',
+                'Vn': 1.0,
+                'v0': d1[-2],
+                'a0': d1[-1] * deg2rad,
+                'area': bus_area[bus1],
+                'owner': bus_owner[bus1],
+                'zone': bus_zone[bus1],
+            })
 
-            param = {'idx': new_bus,
-                     'name': '_'.join([str(i) for i in data[0][:3]]),
-                     'Vn': 1.0,
-                     'v0': data[1][-2],
-                     'a0': data[1][-1] * deg2rad,
-                     'area': area,
-                     'owner': owner,
-                     'zone': zone,
-                     }
+            r_12 = d1[0]
+            x_12 = d1[1]
+            r_23 = d1[3]
+            x_23 = d1[4]
+            r_31 = d1[6]
+            x_31 = d1[7]
 
-            out['Bus'].append(param)
+            if hdr[5] == 2:
+                r_12 = r_12 * system_mva / d1[2]
+                x_12 = x_12 * system_mva / d1[2]
+                r_23 = r_23 * system_mva / d1[5]
+                x_23 = x_23 * system_mva / d1[5]
+                r_31 = r_31 * system_mva / d1[8]
+                x_31 = x_31 * system_mva / d1[8]
 
-            # Get the original impedance values
-            r_12 = data[1][0]
-            x_12 = data[1][1]
-            r_23 = data[1][3]
-            x_23 = data[1][4]
-            r_31 = data[1][6]
-            x_31 = data[1][7]
+            rvals = [
+                (r_12 + r_31 - r_23) / 2,
+                (r_23 + r_12 - r_31) / 2,
+                (r_31 + r_23 - r_12) / 2,
+            ]
+            xvals = [
+                (x_12 + x_31 - x_23) / 2,
+                (x_23 + x_12 - x_31) / 2,
+                (x_31 + x_23 - x_12) / 2,
+            ]
 
-            # Convert to system base if CZ=2
-            if data[0][5] == 2:
-                # Convert from winding base to system base
-                sbase = system.config.mva
-                r_12 = r_12 * sbase / data[1][2]  # SBASE1-2
-                x_12 = x_12 * sbase / data[1][2]
-                r_23 = r_23 * sbase / data[1][5]  # SBASE2-3
-                x_23 = x_23 * sbase / data[1][5]
-                r_31 = r_31 * sbase / data[1][8]  # SBASE3-1
-                x_31 = x_31 * sbase / data[1][8]
+            for i, bus in enumerate((bus1, bus2, bus3)):
+                w = data[2 + i]
 
-            # Calculate star-point resistances and reactances
-            # These values are on system base after the conversion above
-            r = []
-            x = []
-            r.append((r_12 + r_31 - r_23)/2)
-            r.append((r_23 + r_12 - r_31)/2)
-            r.append((r_31 + r_23 - r_12)/2)
-            x.append((x_12 + x_31 - x_23)/2)
-            x.append((x_23 + x_12 - x_31)/2)
-            x.append((x_31 + x_23 - x_12)/2)
-
-            for i in range(0, 3):
-                # Always use system base after conversion
-                Sn = system.config.mva
-
-                # Set magnetizing conductance and susceptance for winding 1 only (first branch)
-                if i == 0:
-                    g1_value = data[0][7]  # Magnetizing conductance (G)
-                    b1_value = data[0][8]  # Magnetizing susceptance (B)
-                else:
-                    g1_value = 0.0         # No magnetization for other windings
-                    b1_value = 0.0         # No magnetization for other windings
-
-                # PSS/E convention: WINDV=0 means use nominal (1.0 per-unit tap ratio)
-                tap_value = data[2+i][0] if data[2+i][0] != 0.0 else 1.0
-
-                param = {'trans': True,
-                         'bus1': data[0][i],
-                         'bus2': new_bus,
-                         'g1': g1_value,
-                         'b1': b1_value,
-                         'r': r[i],
-                         'x': x[i],
-                         'tap': tap_value,
-                         'phi': data[2+i][2] * deg2rad,
-                         'Vn1': system.Bus.get(src='Vn', idx=data[0][i], attr='v'),
-                         'Vn2': 1.0,
-                         'Sn': Sn,
-                         }
-
-                out['Line'].append(param)
+                out['Line'].append({
+                    'trans': True,
+                    'bus1': bus,
+                    'bus2': new_bus,
+                    'g1': hdr[7] if i == 0 else 0.0,
+                    'b1': hdr[8] if i == 0 else 0.0,
+                    'r': rvals[i],
+                    'x': xvals[i],
+                    'tap': w[0] if w[0] != 0.0 else 1.0,
+                    'phi': w[2] * deg2rad,
+                    'Vn1': bus_vn[bus],
+                    'Vn2': 1.0,
+                    'Sn': system_mva,
+                })
 
             xf_3_count += 1
 
@@ -1010,7 +1283,9 @@ def _process_3wt_cz3(data, system):
             x_pu = (z_mag**2 - r_pu**2)**0.5
         else:
             # If |Z| is too small compared to R, assume X is very small
-            logger.warning(f"CZ=3 conversion issue: |Z|^2 < R^2 for winding pair {i+1}. Setting X to small value.")
+            logger.warning(
+                f"CZ=3 conversion issue: |Z|^2 < R^2 for winding pair {
+                    i + 1}. Setting X to small value.")
             x_pu = 1e-6
 
         # Replace the original values with calculated R and X
